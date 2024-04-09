@@ -1,5 +1,7 @@
-# Universal Guidance for Diffusion Models
+# DP-Guidance (copy of Universal Guidance Code)
 <img src="./stable-diffusion-guided/data/images/all_cover_figure.png" width="1000px"></img>
+
+ORIGINAL REPO: https://github.com/arpitbansal297/Universal-Guided-Diffusion/tree/main
 
 The official PyTorch implementation of <a href="https://arxiv.org/abs/2302.07121">Universal Guidance for Diffusion Models</a>. 
 This repository has python implementation of universal guidance algorithm that enables controlling diffusion models by arbitrary guidance modalities without the need to retrain any use-specific components.
