@@ -18,7 +18,15 @@ from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
+from ldm.data.util import VirtualBatchWrapper
 from ldm.util import instantiate_from_config
+from ldm.privacy.myopacus import MyDPLightningDataModule
+
+# Support existing configs referring to names in this file
+from callbacks.cuda import CUDACallback                         # noqa: F401
+from callbacks.image_logger import ImageLogger                  # noqa: F401
+from callbacks.setup import SetupCallback                       # noqa: F401
+from ldm.data.util import DataModuleFromConfig, WrappedDataset 
 
 
 def get_parser(**parser_kwargs):
@@ -521,7 +529,7 @@ if __name__ == "__main__":
         trainer_config["accelerator"] = "ddp"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
+        if "gpus" not in trainer_config:
             del trainer_config["accelerator"]
             cpu = True
         else:
@@ -664,11 +672,22 @@ if __name__ == "__main__":
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.
         # lightning still takes care of proper multiprocessing though
+        # NOTE: Datamodules are set up just before training begins. These
+        #       functions are called because we want to print out some
+        #       train/validation/test dataset stats
         data.prepare_data()
         data.setup()
         print("#### Data #####")
         for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
+            print(f"  {k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
+        dp_config = config.model.params.get("dp_config")
+        if dp_config and dp_config.enabled and dp_config.poisson_sampling:
+            print("Using Poisson sampling")
+            data = MyDPLightningDataModule(data)
+            if dp_config.get("max_batch_size", None):
+                print("Using virtual batch size of", dp_config.max_batch_size)
+                data = VirtualBatchWrapper(data, dp_config.max_batch_size)
+        print()
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate

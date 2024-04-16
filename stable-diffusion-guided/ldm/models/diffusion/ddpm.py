@@ -3,6 +3,7 @@ wild mixture of
 https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
 https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bbbd2d9902ce/improved_diffusion/gaussian_diffusion.py
 https://github.com/CompVis/taming-transformers
+https://anonymous.4open.science/r/DP-LDM-4525/ldm/models/diffusion/ddpm.py
 -- merci
 """
 
@@ -17,17 +18,34 @@ from contextlib import contextmanager
 from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
+from pytorch_lightning.trainer.supporters import CombinedLoader
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from omegaconf.errors import ConfigAttributeError
+from torchvision import transforms, utils
+import GPUtil
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
+from ldm.data.util import get_sample_rate
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
-from torchvision import transforms, utils
-import GPUtil
-from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps
+from ldm.models.diffusion.ddpm_base import DDPM
+from ldm.modules.diffusionmodules.util import extract_into_tensor, noise_like, make_ddim_sampling_parameters, make_ddim_timesteps
+from ldm.modules.distributions.distributions import DiagonalGaussianDistribution, normal_kl
+from ldm.util import default, instantiate_from_config, isimage, ismap, log_txt_as_img, mean_flat
+
+# Transdiff
+import copy
+from ldm.modules.attention import SpatialTransformer
+from ldm.modules.diffusionmodules.openaimodel import AttentionBlock, ResBlock
+
+# Differential Privacy
+import opacus
+from ldm.privacy.myopacus import MyBatchSplittingSampler
+from ldm.privacy.privacy_analysis import compute_noise_multiplier, get_noisysgd_mechanism
+import gc
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -42,6 +60,27 @@ def disabled_train(self, mode=True):
 
 def uniform_on_device(r1, r2, shape, device):
     return (r1 - r2) * torch.rand(*shape, device=device) + r2
+
+
+def init_weights(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv2d') != -1 or classname.find('ConvTranspose2d') != -1:
+        nn.init.kaiming_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.zeros_(m.bias)
+    elif classname.find('Linear') != -1:
+        nn.init.xavier_normal_(m.weight)
+        nn.init.zeros_(m.bias)
+
+
+# transdiff
+def get_parameter_number(model):
+    total_num = sum(p.numel() for p in model.parameters())
+    trainable_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("totol:{}, trainable:{}, percentage:{}".format(total_num, trainable_num, trainable_num / total_num))
+    return {'Total': total_num, 'Trainable': trainable_num, 'Percentage': trainable_num / total_num}
 
 
 class DDPM(pl.LightningModule):
@@ -115,7 +154,6 @@ class DDPM(pl.LightningModule):
         self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
-
 
     def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
@@ -443,6 +481,16 @@ class LatentDiffusion(DDPM):
                  conditioning_key=None,
                  scale_factor=1.0,
                  scale_by_std=False,
+                 retrain_attention=False,
+                 train_attention_only=False,
+                 attention_flag='spatial',
+                 condition_mask=0,
+                 diffusion_mask=0,
+                 train_condition_only=False,
+                 train_input_blocks_only=False,
+                 train_resblocks_only=False,
+                 ablation_blocks=-1,
+                 dp_config=None,
                  *args, **kwargs):
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
         self.scale_by_std = scale_by_std
@@ -471,11 +519,49 @@ class LatentDiffusion(DDPM):
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
         self.bbox_tokenizer = None  
-
+        self.retrain_attention = retrain_attention
         self.restarted_from_ckpt = False
+        self.train_attention_only = train_attention_only
+        self.attention_flag = attention_flag
+        self.condition_mask = condition_mask
+        self.diffuison_mask = diffusion_mask
+        self.train_condition_only = train_condition_only
+        self.train_input_blocks_only = train_input_blocks_only
+        self.train_resblocks_only = train_resblocks_only
+        self.ablation_blocks = ablation_blocks
+        self.restarted_from_ckpt = False
+
         if ckpt_path is not None:
-            self.init_from_ckpt(ckpt_path, ignore_keys)
+            if self.retrain_attention:
+                ignore_keys = self.init_attention(self.attention_flag)
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
             self.restarted_from_ckpt = True
+
+        self.dp_config = dp_config
+        if dp_config and dp_config.enabled:
+            self.privacy_engine = opacus.PrivacyEngine()
+
+    def init_attention(self, attention_flag='spatial'):
+        ignore_keys = []
+        if attention_flag == 'spatial':
+            for nm, m in self.model.named_modules():
+                if isinstance(m, SpatialTransformer):
+                    # m.apply(init_weights)
+                    ignore_keys.append(nm)
+                    # nms=re.sub('.','',nm)
+                    nms = copy.copy(nm).replace('.', '')
+                    ignore_keys.append(nms)
+                    print("init {}".format(nm))
+        elif attention_flag == 'self':
+            for nm, m in self.model.named_modules():
+                if isinstance(m, AttentionBlock):
+                    # m.apply(init_weights)
+                    ignore_keys.append(nm)
+                    # nms=re.sub('.','',nm)
+                    nms = copy.copy(nm).replace('.', '')
+                    ignore_keys.append(nms)
+                    print("init {}".format(nm))
+        return ignore_keys
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -486,7 +572,11 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
         # only for very first batch
-        if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
+        is_first_batch = (self.current_epoch == 0
+                          and self.global_step == 0
+                          and batch_idx == 0
+                          and not self.restarted_from_ckpt)
+        if self.scale_by_std and is_first_batch:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
             # set rescale weight to 1./std of encodings
             print("### USING STD-RESCALING ###")
@@ -498,6 +588,18 @@ class LatentDiffusion(DDPM):
             self.register_buffer('scale_factor', 1. / z.flatten().std())
             print(f"setting self.scale_factor to {self.scale_factor}")
             print("### USING STD-RESCALING ###")
+
+        # HACK: This assumes self.trainer.train_dataloader is a CombinedLoader,
+        #       which may not be true in versions of pytorch_lightning >1.4.1
+        assert isinstance(self.trainer.train_dataloader, CombinedLoader), \
+            "The code assumes `trainer.train_dataloader` is an instance of " \
+            f"CombinedLoader, but it is {type(self.trainer.train_dataloader)} " \
+            "instead. Please update the code to handle this type."
+        batch_sampler = self.trainer.train_dataloader.loaders.batch_sampler
+        if isinstance(batch_sampler, MyBatchSplittingSampler):
+            is_last_batch = batch_sampler.last_batch_queue.get()
+            for optimizer in self.trainer.optimizers:
+                optimizer.signal_skip_step(not is_last_batch)
 
     def register_schedule(self,
                           given_betas=None, beta_schedule="linear", timesteps=1000,
@@ -680,7 +782,6 @@ class LatentDiffusion(DDPM):
         iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps) if verbose else reversed(
             range(0, timesteps))
 
-
         for param in self.first_stage_model.parameters():
             param.requires_grad = False
 
@@ -861,9 +962,6 @@ class LatentDiffusion(DDPM):
         return recons_image
 
 
-
-
-
     def register_buffer_ddim(self, name, attr):
         if type(attr) == torch.Tensor:
             if attr.device != torch.device("cuda"):
@@ -903,8 +1001,6 @@ class LatentDiffusion(DDPM):
                     1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer_ddim('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
-
-
     def operation_diffusion_ddim(self, S,
                batch_size,
                shape,
@@ -929,7 +1025,6 @@ class LatentDiffusion(DDPM):
         # get z
         z = torch.randn(shape, device=device)
         #######
-
 
         timesteps = self.ddim_timesteps
         time_range = np.flip(timesteps)
@@ -994,7 +1089,6 @@ class LatentDiffusion(DDPM):
                     else:
                         selected = -1 * criterion(op_im, operated_image)
 
-
                     print(ts)
                     print(selected)
 
@@ -1015,7 +1109,6 @@ class LatentDiffusion(DDPM):
                         if i % operation.print_every == 0 and j == 0:
                             temp = (recons_image + 1) * 0.5
                             utils.save_image(temp, f'{operation.folder}/guidance_3_{i}.png')
-
 
                 else:
                     model_output = self.apply_model(z, ts, cond)
@@ -1096,7 +1189,6 @@ class LatentDiffusion(DDPM):
                         if i % operation.print_every == 0 and j == 0:
                             temp = (recons_image + 1) * 0.5
                             utils.save_image(temp, f'{operation.folder}/guidance_2_{i}.png')
-
 
                 z_epsilon = (z - a_t.sqrt() * z_recon) / sqrt_one_minus_at
 
@@ -1409,6 +1501,9 @@ class LatentDiffusion(DDPM):
         return self.p_losses(x, c, t, *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
+        def clamp(x):
+            return min(max(x, 0), 1)
+        
         def rescale_bbox(bbox):
             x0 = clamp((bbox[0] - crop_coordinates[0]) / crop_coordinates[2])
             y0 = clamp((bbox[1] - crop_coordinates[1]) / crop_coordinates[3])
@@ -1457,7 +1552,8 @@ class LatentDiffusion(DDPM):
                 cond_list = [{c_key: [c[:, :, :, :, i]]} for i in range(c.shape[-1])]
 
             elif self.cond_stage_key == 'coordinates_bbox':
-                assert 'original_image_size' in self.split_input_params, 'BoudingBoxRescaling is missing original_image_size'
+                assert 'original_image_size' in self.split_input_params, \
+                       'BoudingBoxRescaling is missing original_image_size'
 
                 # assuming padding of unfold is always 0 and its dilation is always 1
                 n_patches_per_row = int((w - ks[0]) / stride[0] + 1)
@@ -1762,24 +1858,23 @@ class LatentDiffusion(DDPM):
                                   mask=mask, x0=x0)
 
     @torch.no_grad()
-    def sample_log(self,cond,batch_size,ddim, ddim_steps,**kwargs):
+    def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
 
         if ddim:
             ddim_sampler = DDIMSampler(self)
             shape = (self.channels, self.image_size, self.image_size)
-            samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
-                                                        shape,cond,verbose=False,**kwargs)
+            samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size,
+                                                         shape, cond, verbose=False, **kwargs)
 
         else:
             samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
-                                                 return_intermediates=True,**kwargs)
+                                                 return_intermediates=True, **kwargs)
 
         return samples, intermediates
 
-
     @torch.no_grad()
-    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
-                   quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
+    def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=400, ddim_eta=1., return_keys=None,
+                   quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=True,
                    plot_diffusion_rows=True, **kwargs):
 
         use_ddim = ddim_steps is not None
@@ -1802,7 +1897,7 @@ class LatentDiffusion(DDPM):
                 xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["caption"])
                 log["conditioning"] = xc
             elif self.cond_stage_key == 'class_label':
-                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["human_label"])
+                xc = log_txt_as_img((x.shape[2], x.shape[3]), batch["class_label"])
                 log['conditioning'] = xc
             elif isimage(xc):
                 log["conditioning"] = xc
@@ -1830,9 +1925,9 @@ class LatentDiffusion(DDPM):
         if sample:
             # get denoise row
             with self.ema_scope("Plotting"):
-                samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                         ddim_steps=ddim_steps,eta=ddim_eta)
-                # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
+                samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                         ddim_steps=ddim_steps, eta=ddim_eta)
+                
             x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
             if plot_denoise_rows:
@@ -1843,11 +1938,10 @@ class LatentDiffusion(DDPM):
                     self.first_stage_model, IdentityFirstStage):
                 # also display when quantizing x0 while sampling
                 with self.ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                             ddim_steps=ddim_steps,eta=ddim_eta,
+                    samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                             ddim_steps=ddim_steps, eta=ddim_eta,
                                                              quantize_denoised=True)
-                    # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
-                    #                                      quantize_denoised=True)
+
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_x0_quantized"] = x_samples
 
@@ -1860,16 +1954,16 @@ class LatentDiffusion(DDPM):
                 mask = mask[:, None, ...]
                 with self.ema_scope("Plotting Inpaint"):
 
-                    samples, _ = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                    samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim, eta=ddim_eta,
+                                                 ddim_steps=ddim_steps, x0=z[:N], mask=mask)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_inpainting"] = x_samples
                 log["mask"] = mask
 
                 # outpaint
                 with self.ema_scope("Plotting Outpaint"):
-                    samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                    samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim, eta=ddim_eta,
+                                                 ddim_steps=ddim_steps, x0=z[:N], mask=mask)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_outpainting"] = x_samples
 
@@ -1888,16 +1982,151 @@ class LatentDiffusion(DDPM):
                 return {key: log[key] for key in return_keys}
         return log
 
+    def get_train_dataloader(self):
+        # Initialize and get the training dataloader
+        # This API is unstable, see https://github.com/Lightning-AI/lightning/issues/10430
+        if hasattr(self.trainer, "setup_data"):
+            self.trainer.fit_loop.setup_data()
+            return self.trainer.train_dataloader
+        elif hasattr(self.trainer, "reset_train_dataloader"):
+            self.trainer.reset_train_dataloader(self)
+            return self.trainer.datamodule.train_dataloader()
+        elif hasattr(self.trainer, "_data_connector"):
+            return self.trainer._data_connector._train_dataloader_source.dataloader()
+        else:
+            raise RuntimeError("Cannot get dataloader in configure_optimizers")
+
     def configure_optimizers(self):
-        lr = self.learning_rate
-        params = list(self.model.parameters())
-        if self.cond_stage_trainable:
-            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
-            params = params + list(self.cond_stage_model.parameters())
-        if self.learn_logvar:
-            print('Diffusion model optimizing logvar')
-            params.append(self.logvar)
-        opt = torch.optim.AdamW(params, lr=lr)
+        print("#### Finetuning ####")
+
+        att_params = []
+        if self.train_condition_only:
+            self.model.requires_grad_(False)
+            spatial_modules = [x for x in self.model.modules() if isinstance(x, SpatialTransformer)]
+            for i, m in enumerate(spatial_modules):
+                # All SpatialTransformer modules propagate gradients to the cond_stage_model
+                m.requires_grad_(True)
+                # Do not unfreeze the first `self.ablation_blocks` AttentionBlocks
+                if i + 1 >= self.ablation_blocks:
+                    att_params.extend(m.parameters())
+
+            self.cond_stage_model.requires_grad_(True)
+            cond_params = self.cond_stage_model.parameters()
+
+            params = att_params + list(cond_params)
+
+            num_blocks = len(spatial_modules)
+            num_blocks_tuned = num_blocks - max(self.ablation_blocks, 0)
+            print(f"  {num_blocks_tuned}/{num_blocks} SpatialTransformers will be trained")
+        elif self.train_attention_only:
+            print("  Training (unconditional) AttentionBlocks only")
+            self.model.requires_grad_(False)
+            attention_modules = [x for x in self.model.modules() if isinstance(x, AttentionBlock)]
+            for i, m in enumerate(attention_modules):
+                # Do not unfreeze the first `self.ablation_blocks` AttentionBlocks
+                if i + 1 >= self.ablation_blocks:
+                    m.requires_grad_(True)
+                    att_params.extend(m.parameters())
+            params = att_params
+
+            num_blocks = len(attention_modules)
+            num_blocks_tuned = num_blocks - max(self.ablation_blocks, 0)
+            print(f"  {num_blocks_tuned}/{num_blocks} AttentionBlocks will be trained")
+        elif self.train_input_blocks_only:
+            print("  Only training SpatialTransformers or AttentionBlocks in input_blocks", end="")
+            self.model.requires_grad_(True)
+            params = []
+            for m in self.model.diffusion_model.input_blocks.modules():
+                if isinstance(m, AttentionBlock) or isinstance(m, SpatialTransformer):
+                    params.extend(m.parameters())
+            if self.cond_stage_model:
+                print(" and cond_stage_model", end="")
+                self.cond_stage_model.requires_grad_(True)
+                params.extend(self.cond_stage_model.parameters())
+            print()
+        elif self.train_resblocks_only:
+            print("  Only training ResBlocks", end="")
+            self.model.requires_grad_(True)
+            params = []
+            resblocks = [x for x in self.model.modules() if isinstance(x, ResBlock)]
+            for block in resblocks:
+                params.extend(block.parameters())
+            if self.cond_stage_model:
+                print(" and cond_stage_model", end="")
+                self.cond_stage_model.requires_grad_(True)
+                params.extend(self.cond_stage_model.parameters())
+            print()
+        else:
+            self.model.requires_grad_(True)
+            if self.ablation_blocks > 0:
+                self.model.requires_grad_(False)
+                current_block = 0
+                TUNEFLAG = False
+                att_params = []
+                # params = self.cond_stage_model.parameters()
+                for nm, m in self.model.named_modules():
+                    if isinstance(m, SpatialTransformer):
+                        current_block += 1
+                        if current_block == self.ablation_blocks - 1:
+                            TUNEFLAG = True
+                            print("Begin with Layer {}".format(current_block + 1))
+                    if TUNEFLAG:
+                        m.requires_grad_(True)
+                        att_params.extend(m.parameters())
+                params = att_params
+            else:
+                params = list(self.model.parameters())
+            # if self.cond_stage_trainable:
+            #     print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
+            #     params = params + list(self.cond_stage_model.parameters())
+            if self.learn_logvar:
+                print('  Diffusion model optimizing logvar')
+                params.append(self.logvar)
+
+        num_model_params = sum(p.numel() for p in self.model.parameters())
+        num_cond_params = sum(p.numel() for p in self.cond_stage_model.parameters()) if self.cond_stage_model else 0
+        num_params = num_model_params + num_cond_params
+        num_model_grad = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        num_cond_grad = sum(p.numel() for p in self.cond_stage_model.parameters() if p.requires_grad) if self.cond_stage_model else 0
+        num_grad = num_model_grad + num_cond_grad
+        num_train = sum(p.numel() for p in params)
+        print(f"  {num_grad}/{num_params} ({num_grad/num_params*100:.02f}%) parameters will compute gradients")
+        print(f"  {num_train}/{num_params} ({num_train/num_params*100:.02f}%) parameters will be trained")
+        print()
+
+        opt = torch.optim.AdamW(params, lr=self.learning_rate)
+
+        # Wrap the optimizer if differentially private training is enabled
+        if self.dp_config and self.dp_config.enabled:
+            # Compute the noise scale required for DP-SGD
+            data_loader = self.get_train_dataloader()
+            self.sample_rate = get_sample_rate(data_loader)
+            self.noise_scale = compute_noise_multiplier(
+                self.dp_config,
+                self.sample_rate,
+                self.trainer.max_epochs
+            )
+
+            # Add DP hooks to the model and optimizer for DPSGD implementation
+            _, opt, _ = self.privacy_engine.make_private(
+                module=self,
+                optimizer=opt,
+                # The sensitivity of replace-one DP is double that of add-remove
+                #   DP, so the noise multiplier needs to be doubled in DPSGD
+                noise_multiplier=self.noise_scale,
+                max_grad_norm=self.dp_config.max_grad_norm,
+                # NOTE: The data loader is recreated in main.py, so these parameters do nothing
+                data_loader=data_loader,
+                poisson_sampling=self.dp_config.poisson_sampling,
+            )
+
+            print()
+            print("#### Differential Privacy ####")
+            print("  Epsilon:", self.dp_config.epsilon)
+            print("  Delta:", self.dp_config.delta)
+            print("  Noise Scale:", self.noise_scale)
+            print()
+
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
@@ -1912,6 +2141,12 @@ class LatentDiffusion(DDPM):
             return [opt], scheduler
         return opt
 
+    def optimizer_zero_grad(self, *args, **kwargs):
+        super().optimizer_zero_grad(*args, **kwargs)
+        self.zero_grad(set_to_none=True)
+        for p in self.parameters():
+            p.grad_sample = None
+
     @torch.no_grad()
     def to_rgb(self, x):
         x = x.float()
@@ -1920,6 +2155,19 @@ class LatentDiffusion(DDPM):
         x = nn.functional.conv2d(x, weight=self.colorize)
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
+
+    @torch.no_grad()
+    def get_epsilon_spent(self, step):
+        if self.dp_config is None or not self.dp_config.enabled:
+            return 0
+        elif self.dp_config.poisson_sampling:
+            return self.privacy_engine.get_epsilon(self.dp_config.delta)
+        else:
+            return get_noisysgd_mechanism(
+                self.noise_scale,
+                self.sample_rate,
+                step
+            ).get_approxDP(self.dp_config.delta)
 
 
 class DiffusionWrapper(pl.LightningModule):
