@@ -31,7 +31,6 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.ddpm_base import DDPM
 from ldm.modules.diffusionmodules.util import extract_into_tensor, noise_like, make_ddim_sampling_parameters, make_ddim_timesteps
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution, normal_kl
 from ldm.util import default, instantiate_from_config, isimage, ismap, log_txt_as_img, mean_flat
@@ -1653,7 +1652,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t.cpu()].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:

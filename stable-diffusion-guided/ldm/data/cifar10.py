@@ -9,7 +9,7 @@ from torchvision import datasets
 class CIFAR10Base(datasets.CIFAR10):
     def __init__(self, size=None, interpolation="bicubic", flip_p=0.5, **kwargs):
         self.size = size
-        self.interpolation = {"linear": PIL.Image.LINEAR,
+        self.interpolation = {"linear": PIL.Image.BILINEAR,
                               "bilinear": PIL.Image.BILINEAR,
                               "bicubic": PIL.Image.BICUBIC,
                               "lanczos": PIL.Image.LANCZOS,

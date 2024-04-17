@@ -29,7 +29,7 @@ model:
     ablation_blocks: 9
     attention_flag: spatial
     channels: 3
-    ckpt_path:  'path\to\pretrained\ldm.ckpt'
+    ckpt_path:  /lfs/skampere1/0/pura/models/vq-f4.ckpt
     cond_stage_config:
       params:
         embed_dim: 512
