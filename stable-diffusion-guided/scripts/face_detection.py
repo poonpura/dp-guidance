@@ -108,13 +108,7 @@ def load_replacement(x):
 
 
 def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-    x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
+    return x_image
 
 class Dataset(data.Dataset):
     def __init__(self, folder, image_size, data_aug=False, exts=['jpg', 'jpeg', 'png']):
@@ -408,10 +402,9 @@ def main():
 
     torch.set_grad_enabled(False)
 
-    if opt.text != None:
-        prompt = opt.text
-    else:
-        prompt = get_face_text(opt.text_type)
+    prompt = opt.text
+    
+    get_face_text(opt.text_type)
 
     print(prompt)
 

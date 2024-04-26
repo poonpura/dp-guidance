@@ -39,6 +39,13 @@ model:
     cond_stage_key: class_label
     cond_stage_trainable: true
     conditioning_key: crossattn
+    dp_config:
+      delta: 1.0e-05
+      enabled: true
+      epsilon: 10
+      max_batch_size: 40
+      max_grad_norm: 1.0e-06
+      poisson_sampling: true
     first_stage_config:
       params:
         ddconfig:
