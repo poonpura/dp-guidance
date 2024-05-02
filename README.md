@@ -12,6 +12,11 @@ Our implementation is based on the text-to-img model from <a href="https://githu
 
 The differentially private finetuning portion of this codebase is mainly adapted from <a href="https://anonymous.4open.science/r/DP-LDM-4525/README.md">this repository</a>. To run differentially private finetuning, follow the instructions in the link. Note that the `--gpus` argument should take in the number of GPUs used, not a list of the GPUs used (those are fed into `CUDA_VISIBLE_DEVICES`).
 
+Finetuning code 
+```
+CUDA_VISIBLE_DEVICES=4 python main.py --base configs/finetuning/pokemon-test.yaml -t --gpus 1 --accelerator gpu
+```
+
 ## Stable Diffusion
 ```
 cd stable-diffusion-guided
