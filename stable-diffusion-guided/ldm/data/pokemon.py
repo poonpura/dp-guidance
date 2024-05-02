@@ -11,9 +11,10 @@ def preprocess_image(png_bytes, interpolation, transforms):
     image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     assert image.size[0] == image.size[1]
     size, _ = image.size
-    image_resized = image.resize((256, 256), interpolation)
-    tensor = transforms(image_resized)
-    return tensor
+    image = image.resize((256, 256), interpolation)
+    image = transforms(image)
+    image = np.array(image).astype(np.uint8)
+    return (image / 127.5 - 1.0).astype(np.float32)
 
 def preprocess_string(s):
     if "Pokemon" in s:
@@ -64,10 +65,9 @@ class PokemonDataset(Dataset):
             transforms.RandomResizedCrop(256, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(),        
             transforms.RandomRotation(15),  
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
-            transforms.ToTensor()
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1)
         ])
-        self.val_transforms = transforms.ToTensor()
+        self.val_transforms = lambda x: x
 
     def __len__(self):
         return len(self.data)
