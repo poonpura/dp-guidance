@@ -10,11 +10,20 @@ Our implementation is based on the text-to-img model from <a href="https://githu
 
 ### Differential Privacy Implementation (SPECIFIC TO THIS IMPLEMENTATION)
 
+Run all scripts from the `stable-diffusion-guided` directory.
+
 The differentially private finetuning portion of this codebase is mainly adapted from <a href="https://anonymous.4open.science/r/DP-LDM-4525/README.md">this repository</a>. To run differentially private finetuning, follow the instructions in the link. Note that the `--gpus` argument should take in the number of GPUs used, not a list of the GPUs used (those are fed into `CUDA_VISIBLE_DEVICES`).
+
+To set up the Pokemon finetuning dataset, download the dataset <a href="https://huggingface.co/datasets/diffusers/pokemon-llava-captions">here</a>, and modify line 46 in `ldm/data/pokemon.py` to point to the parquet file.
 
 Finetuning code 
 ```
 CUDA_VISIBLE_DEVICES=4 python main.py --base configs/finetuning/pokemon-test.yaml -t --gpus 1 --accelerator gpu
+```
+To generate images without guidance 
+```
+ln -s <path to Stable Diffusion checkpoint> models/ldm/stable-diffusion-v1/model.ckpt
+CUDA_VISIBLE_DEVICES=4 python scripts/txt2img.py --prompt "A blue and black dragon Pokemon with purple and pink horns" --plms
 ```
 
 ## Stable Diffusion
