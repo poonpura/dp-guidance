@@ -8,6 +8,9 @@ This repository has python implementation of universal guidance algorithm that e
 Different guidance modalities we demonstrate are Human Identity, Segmentation Maps, Object Location, Image Style and Clip.
 Our implementation is based on the text-to-img model from <a href="https://github.com/CompVis/stable-diffusion">Stable Diffusion</a> and Imagenet Diffusion Model from <a href="https://github.com/openai/guided-diffusion">OpenAI's guided diffusion</a>.
 
+### Differential Privacy Implementation
+
+The differentially private finetuning portion of this codebase is mainly adapted from <a href="https://anonymous.4open.science/r/DP-LDM-4525/README.md">this repository</a>. To run differentially private finetuning, follow the instructions in the link. Note that the `--gpus` argument should take in the number of GPUs used, not a list of the GPUs used (those are fed into `CUDA_VISIBLE_DEVICES`).
 
 ## Stable Diffusion
 ```
