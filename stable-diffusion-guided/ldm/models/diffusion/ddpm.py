@@ -386,6 +386,8 @@ class DDPM(pl.LightningModule):
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx):
+        if batch["image"].numel() == 0:
+            return None
         loss, loss_dict = self.shared_step(batch)
 
         self.log_dict(loss_dict, prog_bar=True,
@@ -465,7 +467,6 @@ class DDPM(pl.LightningModule):
             params = params + [self.logvar]
         opt = torch.optim.AdamW(params, lr=lr)
         return opt
-
 
 class LatentDiffusion(DDPM):
     """main class"""
@@ -2115,7 +2116,7 @@ class LatentDiffusion(DDPM):
                 optimizer=opt,
                 # The sensitivity of replace-one DP is double that of add-remove
                 #   DP, so the noise multiplier needs to be doubled in DPSGD
-                noise_multiplier=self.noise_scale,
+                noise_multiplier=self.noise_scale * 0.1,
                 max_grad_norm=self.dp_config.max_grad_norm,
                 # NOTE: The data loader is recreated in main.py, so these parameters do nothing
                 data_loader=data_loader,

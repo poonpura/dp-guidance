@@ -7,8 +7,10 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms 
 from PIL import Image 
 
-def preprocess_image(png_bytes, interpolation, transforms):
-    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+PATH = "/lfs/skampere1/0/pura/datasets/sotonami/"
+
+def preprocess_image(filename, interpolation, transforms):
+    image = Image.open(filename).convert("RGB")
     assert image.size[0] == image.size[1]
     size, _ = image.size
     image = image.resize((256, 256), interpolation)
@@ -16,42 +18,27 @@ def preprocess_image(png_bytes, interpolation, transforms):
     image = np.array(image).astype(np.uint8)
     return (image / 127.5 - 1.0).astype(np.float32)
 
-def preprocess_string(s):
-    if "Pokemon" in s:
-        return s
-    nouns = ["animal", "cartoon character", "creature", "monster", "character"]
-    for noun in nouns:
-        s = s.replace(noun, "Pokemon")
-    if "Pokemon" in s:
-        return s
-    s = s.replace("flower with", "flower Pokemon with")
-    if "Pokemon" in s:
-        return s
-    species = ["bird", "dog", "dragon", "sheep", "dinosaur", "butterfly", 
-                "turtle", "bee", "shark", "whale", "pig", "rabbit", "insect", 
-                "toy", "snake", "sun", "moon", "crab", "lizard", "ghost", "seal",
-                "robot", "cat", "serpent", "monkey", "lion", "bat", "eggplant",
-                "bunny", "alligator", "frog", "spider", "car", "mouse", 
-                "ice cream cone", "deer", "alien", "chandelier", "bear", "mermaid",
-                "plant", "horse"]
-    species = list(dict.fromkeys(species)) # remove duplicates
-    for x in species:
-        s = s.replace(x, f"{x} Pokemon")
-        if "Pokemon" in s:
-            return s 
-    return s
-
-class PokemonDataset(Dataset):
+class IshidaSuiClassifierDataset(Dataset):
     def __init__(self, size=None, interpolation="bicubic", split=0.9, seed=25, **kwargs):
-        df = pd.read_parquet("/lfs/skampere1/0/pura/datasets/pokemon-llava-captions/data/train-00000-of-00001-dd72dfb2bf009aab.parquet")
         self.interpolation = {"linear": Image.BILINEAR,
                               "bilinear": Image.BILINEAR,
                               "bicubic": Image.BICUBIC,
                               "lanczos": Image.LANCZOS,
                               }[interpolation]
-        self.data = pd.DataFrame()
-        self.data["image"] = df["image"].map(lambda x: x["bytes"])
-        self.data["text"] = df["text"]
+
+        # loading positives 
+        df = pd.read_csv(PATH + "metadata.csv")
+        pos = pd.DataFrame()
+        pos["filename"] = df["filename"].map(lambda x: f"data/{x}")
+        pos["label"] = 1
+
+        # loading negatives
+        neg = pd.DataFrame({
+            'filename': [f"control/samples/{i:05d}.png" for i in range(n + 1)], 
+            'label': [0] * (n + 1) 
+        })
+
+        self.data = pd.concat([pos, neg], ignore_index=True)
 
         # Get train-val split
         random.seed(seed)
@@ -67,7 +54,7 @@ class PokemonDataset(Dataset):
             transforms.RandomRotation(15),  
             transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1)
         ])
-        self.val_transforms = lambda x: x
+        self.val_transforms = self.train_transforms
 
     def __len__(self):
         return len(self.data)
@@ -77,21 +64,21 @@ class PokemonDataset(Dataset):
             transforms = self.train_transforms
         else:
             transforms = self.val_transforms
+        path = PATH + self.data["file_name"][idx]
         return {
-            "image" : preprocess_image(self.data["image"][idx], 
-                                                self.interpolation, transforms),
-            "caption" : preprocess_string(self.data["text"][idx]),
+            "image" : preprocess_image(path, self.interpolation, transforms),
+            "caption" : self.data["text"][idx],
             "idx" : idx
         }
 
 
-class PokemonTrain(PokemonDataset):
+class IshidaSuiClassifierTrain(IshidaSuiClassifierDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.data = self.data[self.data["split"] == "train"].reset_index(drop=True)
 
 
-class PokemonVal(PokemonDataset):
+class IshidaSuiClassifierVal(IshidaSuiClassifierDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.data = self.data[self.data["split"] == "valid"].reset_index(drop=True)

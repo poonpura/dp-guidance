@@ -109,7 +109,7 @@ def main():
         type=str,
         nargs="?",
         help="dir to write results to",
-        default="outputs/txt2img-samples"
+        default="outputs/txt2img-samples/"
     )
     parser.add_argument(
         "--skip_grid",
