@@ -2116,7 +2116,7 @@ class LatentDiffusion(DDPM):
                 optimizer=opt,
                 # The sensitivity of replace-one DP is double that of add-remove
                 #   DP, so the noise multiplier needs to be doubled in DPSGD
-                noise_multiplier=self.noise_scale * 0.1,
+                noise_multiplier=self.noise_scale,
                 max_grad_norm=self.dp_config.max_grad_norm,
                 # NOTE: The data loader is recreated in main.py, so these parameters do nothing
                 data_loader=data_loader,

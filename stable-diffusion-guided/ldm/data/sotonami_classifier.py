@@ -8,6 +8,8 @@ from torchvision import transforms
 from PIL import Image 
 
 PATH = "/lfs/skampere1/0/pura/datasets/sotonami/"
+NEG_SIZE = 1640
+
 
 def preprocess_image(filename, interpolation, transforms):
     image = Image.open(filename).convert("RGB")
@@ -17,6 +19,16 @@ def preprocess_image(filename, interpolation, transforms):
     image = transforms(image)
     image = np.array(image).astype(np.uint8)
     return (image / 127.5 - 1.0).astype(np.float32)
+
+def index_map(i):
+    raw_index = i // 10
+    if raw_index <= 111:
+        return raw_index:
+    elif raw_index <= 117:
+        return raw_index + 2
+    else:
+        return raw_index + 3
+
 
 class IshidaSuiClassifierDataset(Dataset):
     def __init__(self, size=None, interpolation="bicubic", split=0.9, seed=25, **kwargs):
@@ -34,8 +46,8 @@ class IshidaSuiClassifierDataset(Dataset):
 
         # loading negatives
         neg = pd.DataFrame({
-            'filename': [f"control/samples/{i:05d}.png" for i in range(n + 1)], 
-            'label': [0] * (n + 1) 
+            'filename': [f"control/samples/{i:05d}.png" for i in range(NEG_SIZE)], 
+            'label': [0] * (NEG_SIZE) 
         })
 
         self.data = pd.concat([pos, neg], ignore_index=True)
@@ -67,8 +79,7 @@ class IshidaSuiClassifierDataset(Dataset):
         path = PATH + self.data["file_name"][idx]
         return {
             "image" : preprocess_image(path, self.interpolation, transforms),
-            "caption" : self.data["text"][idx],
-            "idx" : idx
+            "label" : self.data["label"] 
         }
 
 

@@ -1,7 +1,7 @@
 data:
   params:
     batch_size: 8
-    num_workers: 5
+    num_workers: 1
     train:
       params:
         size: 256
@@ -22,7 +22,7 @@ lightning:
       target: main.ImageLogger
   trainer:
     benchmark: true
-    max_epochs: 50
+    max_epochs: 250
 model:
   base_learning_rate: 1.0e-3
   target: ldm.models.diffusion.ddpm.LatentDiffusion
@@ -43,7 +43,7 @@ model:
       delta: 1.0e-03
       enabled: true
       epsilon: 10
-      max_batch_size: 40
+      max_batch_size: 4
       max_grad_norm: 1.0
       poisson_sampling: true
     monitor: val/loss_simple_ema
