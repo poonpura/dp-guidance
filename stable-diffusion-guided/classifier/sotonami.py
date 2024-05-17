@@ -19,7 +19,7 @@ from PIL import Image
 PATH = "/lfs/skampere1/0/pura/datasets/sotonami/"
 NEG_SIZE = 1640
 
-def preprocess_image(filename, interpolation, transforms):
+def _preprocess_image(filename, interpolation, transforms):
     image = Image.open(filename).convert("RGB")
     assert image.size[0] == image.size[1]
     size, _ = image.size
@@ -27,7 +27,7 @@ def preprocess_image(filename, interpolation, transforms):
     image = transforms(image)
     return image
 
-def index_map(i):
+def _index_map(i):
     raw_index = i // 10
     if raw_index <= 111:
         return raw_index
@@ -92,7 +92,7 @@ class IshidaSuiClassifierDataset(Dataset):
             transforms = self.val_transforms
         path = PATH + self.data["filename"][idx]
         return {
-            "image" : preprocess_image(path, self.interpolation, transforms),
+            "image" : _preprocess_image(path, self.interpolation, transforms),
             "label" : self.data["label"][idx]
         }
 
@@ -111,13 +111,14 @@ class IshidaSuiClassifierVal(IshidaSuiClassifierDataset):
 
 ### DATALOADER ###
 
-def collate(batch):
+def _collate(batch):
     images = torch.stack([item['image'] for item in batch])
     labels = torch.tensor([item['label'] for item in batch])
     return images, labels
 
 
 class IshidaSuiDataModule(pl.LightningDataModule):
+
     def __init__(self, batch_size, shuffle):
         super().__init__()
         self.batch_size = batch_size
@@ -131,14 +132,19 @@ class IshidaSuiDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         self.train_dataset = IshidaSuiClassifierTrain(transform=self.transform)
         self.val_dataset = IshidaSuiClassifierVal(transform=self.transform)
+        self.dataset = IshidaSuiClassifierDataset(transform=self.transform)
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, 
-                            shuffle=self.shuffle, collate_fn=collate)
+                            shuffle=self.shuffle, collate_fn=_collate)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size,
-                            shuffle=self.shuffle, collate_fn=collate)
+                            shuffle=self.shuffle, collate_fn=_collate)
+
+    def dataloader(self):
+        return DataLoader(self.dataset, batch_size=self.batch_size,
+                            shuffle=self.shuffle, collate_fn=_collate)
 
 
 ### LIGHTNING MODULE ###
