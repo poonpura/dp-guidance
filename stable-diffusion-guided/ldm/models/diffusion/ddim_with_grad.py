@@ -141,7 +141,8 @@ class DDIMSamplerWithGrad(object):
                     else:
                         e_t = self.model.module.apply_model(img_in, ts, cond)
 
-                    pred_x0 = (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
+
+                    pred_x0 = img_in if operation.classic else (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
                     recons_image = self.model.module.decode_first_stage_with_grad(pred_x0)
 
                     if other_guidance_func != None:
@@ -312,7 +313,7 @@ class DDIMSamplerWithGrad(object):
                     else:
                         e_t = self.model.module.apply_model(img_in, ts, cond)
 
-                    pred_x0 = (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
+                    pred_x0 = img_in if operation.classic else (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
                     recons_image = self.model.module.decode_first_stage_with_grad(pred_x0)
 
                     if other_guidance_func != None:
@@ -459,7 +460,7 @@ class DDIMSamplerWithGrad(object):
                 else:
                     e_t = self.model.module.apply_model(img_in, ts, cond)
 
-                pred_x0 = (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
+                pred_x0 = img_in if operation.classic else (img_in - sqrt_one_minus_at * e_t) / a_t.sqrt()
                 recons_image = self.model.module.decode_first_stage_with_grad(pred_x0)
 
 

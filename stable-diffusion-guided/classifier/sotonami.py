@@ -8,18 +8,25 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
+import opacus
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from PIL import Image 
+from PIL import Image
+
+from ldm.data.util import get_sample_rate
+from ldm.privacy.myopacus import MyBatchSplittingSampler
+from ldm.privacy.privacy_analysis import compute_noise_multiplier
+ 
+# TODO: Implement Opacus batch memory manager 
 
 ### DATASET ###
 
 PATH = "/lfs/skampere1/0/pura/datasets/sotonami/"
 NEG_SIZE = 1640
 
-def _preprocess_image(filename, interpolation, transforms):
+def preprocess_image(filename, interpolation, transforms):
     image = Image.open(filename).convert("RGB")
     assert image.size[0] == image.size[1]
     size, _ = image.size
@@ -27,7 +34,7 @@ def _preprocess_image(filename, interpolation, transforms):
     image = transforms(image)
     return image
 
-def _index_map(i):
+def index_map(i):
     raw_index = i // 10
     if raw_index <= 111:
         return raw_index
@@ -82,6 +89,7 @@ class IshidaSuiClassifierDataset(Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
+
     def __len__(self):
         return len(self.data)
 
@@ -92,7 +100,7 @@ class IshidaSuiClassifierDataset(Dataset):
             transforms = self.val_transforms
         path = PATH + self.data["filename"][idx]
         return {
-            "image" : _preprocess_image(path, self.interpolation, transforms),
+            "image" : preprocess_image(path, self.interpolation, transforms),
             "label" : self.data["label"][idx]
         }
 
@@ -111,14 +119,13 @@ class IshidaSuiClassifierVal(IshidaSuiClassifierDataset):
 
 ### DATALOADER ###
 
-def _collate(batch):
+def collate(batch):
     images = torch.stack([item['image'] for item in batch])
     labels = torch.tensor([item['label'] for item in batch])
     return images, labels
 
 
 class IshidaSuiDataModule(pl.LightningDataModule):
-
     def __init__(self, batch_size, shuffle):
         super().__init__()
         self.batch_size = batch_size
@@ -136,21 +143,22 @@ class IshidaSuiDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, 
-                            shuffle=self.shuffle, collate_fn=_collate)
+                            shuffle=self.shuffle, collate_fn=collate)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size,
-                            shuffle=self.shuffle, collate_fn=_collate)
+                            shuffle=self.shuffle, collate_fn=collate)
 
     def dataloader(self):
         return DataLoader(self.dataset, batch_size=self.batch_size,
-                            shuffle=self.shuffle, collate_fn=_collate)
+                            shuffle=self.shuffle, collate_fn=collate)
 
 
 ### LIGHTNING MODULE ###
 
 class ClassifierModule(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, lr=0.001, dp=False, epsilon=10, delta=1e-5,
+                max_batch_size=64, max_grad_norm=1.0, poisson_sampling=True):
         super().__init__()
         self.model = models.resnet50(pretrained=True)
         for param in self.model.parameters():
@@ -158,13 +166,45 @@ class ClassifierModule(pl.LightningModule):
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, 2) 
         self.criterion = torch.nn.CrossEntropyLoss()
         self.f1_score = torchmetrics.F1(num_classes=2)
+        self.lr = lr
+
+        self.dp = {
+            "enabled" : True,
+            "epsilon" : epsilon,
+            "delta" : delta,
+            "max_batch_size" : max_batch_size,
+            "max_grad_norm" : max_grad_norm,
+            "poisson_sampling" : poisson_sampling
+        } if dp else {"enabled" : False}
+
 
     def forward(self, x):
         return self.model(x)
 
+
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+        if self.dp["enabled"]:
+            privacy_engine = opacus.PrivacyEngine()
+            dataloader = self.trainer.datamodule.train_dataloader()
+            sample_rate = get_sample_rate(dataloader)
+            noise_multiplier = compute_noise_multiplier(
+                self.dp, 
+                sample_rate,
+                self.trainer.max_epochs
+            )
+            _, optimizer, _ = privacy_engine.make_private(
+                module=self,
+                optimizer=optimizer,
+                data_loader=dataloader,
+                noise_multiplier=noise_multiplier,
+                max_grad_norm=self.dp["max_grad_norm"],
+                poisson_sampling=self.dp["poisson_sampling"]
+            )
+
         return optimizer
+
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -172,6 +212,7 @@ class ClassifierModule(pl.LightningModule):
         loss = self.criterion(logits, y)
         self.log('train_loss', loss)
         return loss
+
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
@@ -195,7 +236,15 @@ def main(args):
 
         data_module = IshidaSuiDataModule(batch_size=args.batch_size, 
                                             shuffle=args.shuffle)
-        model = ClassifierModule()
+        model = ClassifierModule(
+            lr=args.lr, 
+            dp=args.dp_enabled,
+            epsilon=args.dp_epsilon,
+            delta=args.dp_delta,
+            max_batch_size=args.dp_max_batch_size,
+            max_grad_norm=args.dp_max_grad_norm,
+            poisson_sampling=args.dp_poisson_sampling
+        )
 
         checkpoint_callback_top_k = ModelCheckpoint(
             monitor='val_f1',               
@@ -253,6 +302,14 @@ if __name__ == "__main__":
                         help="whether to shuffle the dataset")
     parser.add_argument("--seed", type=int, default=42,
                         help="seed for random operations")
+    parser.add_argument("--dp_enabled", action="store_true",
+                        help="whether to use dp")
+    parser.add_argument("--dp_epsilon", type=float, default=10)
+    parser.add_argument("--dp_delta", type=float, default=1.0e-05)
+    parser.add_argument("--dp_max_batch_size", type=int, default=64,
+                        help="maximum physical batch size when using dp")
+    parser.add_argument("--dp_max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--dp_poisson_sampling", action="store_true")
     
     args = parser.parse_args()
     main(args)

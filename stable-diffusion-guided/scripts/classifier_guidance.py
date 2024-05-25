@@ -53,6 +53,7 @@ def get_optimation_details(args, device):
 
     operation.max_iters = args.optim_max_iters
     operation.loss_cutoff = args.optim_loss_cutoff
+    operation.classic = args.classic_guidance
 
     operation.guidance_3 = args.optim_forward_guidance
     operation.guidance_2 = args.optim_backward_guidance
@@ -191,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", default=1, type=int)
     parser.add_argument("--classifier_ckpt", default="", type=str)
     parser.add_argument("--target_label", default=0, type=int)
+    parser.add_argument("--classic_guidance", action="store_true")
 
     args = parser.parse_args()
     main(args)
