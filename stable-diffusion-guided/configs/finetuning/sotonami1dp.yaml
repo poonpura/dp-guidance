@@ -40,9 +40,9 @@ model:
     cond_stage_trainable: false   # Note: different from the one we trained before
     conditioning_key: crossattn
     dp_config:
-      delta: 1.0e-03
+      delta: 1.0e-04
       enabled: false
-      epsilon: 10
+      epsilon: 20
       max_batch_size: 4
       max_grad_norm: 1.0
       poisson_sampling: true

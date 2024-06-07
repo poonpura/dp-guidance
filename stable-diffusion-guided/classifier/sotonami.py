@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
 import opacus
+import wandb
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from pytorch_lightning import Trainer
@@ -157,16 +158,31 @@ class IshidaSuiDataModule(pl.LightningDataModule):
 ### LIGHTNING MODULE ###
 
 class ClassifierModule(pl.LightningModule):
-    def __init__(self, lr=0.001, dp=False, epsilon=10, delta=1e-5,
-                max_batch_size=64, max_grad_norm=1.0, poisson_sampling=True):
+
+    def __init__(self, 
+            lr=0.001, 
+            dp=False, 
+            epsilon=10, 
+            delta=1e-5,
+            max_batch_size=64, 
+            max_grad_norm=1.0, 
+            poisson_sampling=True,
+            classic_guidance=False
+        ):
         super().__init__()
+        
         self.model = models.resnet50(pretrained=True)
         for param in self.model.parameters():
             param.requires_grad = False
-        self.model.fc = torch.nn.Linear(self.model.fc.in_features, 2) 
         self.criterion = torch.nn.CrossEntropyLoss()
         self.f1_score = torchmetrics.F1(num_classes=2)
         self.lr = lr
+
+        self.classic_guidance = classic_guidance
+        if self.classic_guidance:
+            self.model.fc = torch.nn.Linear(self.model.fc.in_features + 1, 2)
+        else:
+            self.model.fc = torch.nn.Linear(self.model.fc.in_features, 2)
 
         self.dp = {
             "enabled" : True,
@@ -179,7 +195,10 @@ class ClassifierModule(pl.LightningModule):
 
 
     def forward(self, x):
-        return self.model(x)
+        if not self.classic_guidance:
+            return self.model(x)
+
+        raise NotImplementedError
 
 
     def configure_optimizers(self):
@@ -211,6 +230,7 @@ class ClassifierModule(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         self.log('train_loss', loss)
+        wandb.log({"train_loss": loss})
         return loss
 
 
@@ -225,6 +245,7 @@ class ClassifierModule(pl.LightningModule):
         f1 = self.f1_score(y_pred, y)
         self.log('val_f1', f1)
 
+        wandb.log({"f1": f1, "val_loss": val_loss})
         return val_loss
 
 
@@ -234,8 +255,11 @@ def main(args):
     if args.train:
         torch.manual_seed(args.seed)
 
-        data_module = IshidaSuiDataModule(batch_size=args.batch_size, 
-                                            shuffle=args.shuffle)
+        data_module = IshidaSuiDataModule(
+            batch_size=args.batch_size, 
+            shuffle=args.shuffle,
+            classic_guidance=args.classic_guidance
+        )
         model = ClassifierModule(
             lr=args.lr, 
             dp=args.dp_enabled,
@@ -266,6 +290,11 @@ def main(args):
             patience=args.patience,
             strict=True,
             verbose=True)
+
+        wandb.init(
+            project=args.name,
+            config=vars(args)
+        )
         
         trainer = Trainer(
             callbacks=[checkpoint_callback_top_k, checkpoint_callback_last,
@@ -274,12 +303,14 @@ def main(args):
             gpus=args.gpus)  
         trainer.fit(model, datamodule=data_module)
 
+        wandb.finish()
+
     elif args.test:
         raise NotImplementedError
        
 
 if __name__ == "__main__":
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d|%H:%M:%S")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--train", action="store_true",
@@ -291,7 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32,
                         help="batch size")
     parser.add_argument("--name", type=str, default=timestamp,
-                        help="name of current run for output directory")
+                        help="name of current run for output directory + wandb")
     parser.add_argument("--test", action="store_true",
                         help="whether to run the model")
     parser.add_argument("--patience", type=int, default=5,
@@ -302,6 +333,8 @@ if __name__ == "__main__":
                         help="whether to shuffle the dataset")
     parser.add_argument("--seed", type=int, default=42,
                         help="seed for random operations")
+    parser.add_argument("--classic_guidance", action="store_true",
+                        help="whether to add noise and noise level as input of traditional classifier guidance")
     parser.add_argument("--dp_enabled", action="store_true",
                         help="whether to use dp")
     parser.add_argument("--dp_epsilon", type=float, default=10)
