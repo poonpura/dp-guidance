@@ -167,7 +167,11 @@ class ClassifierModule(pl.LightningModule):
             max_batch_size=64, 
             max_grad_norm=1.0, 
             poisson_sampling=True,
-            classic_guidance=False
+            classic_guidance=False,
+            weight_decay=0,
+            beta1=0.9,
+            beta2=0.999,
+            h=0
         ):
         super().__init__()
         
@@ -177,12 +181,23 @@ class ClassifierModule(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
         self.f1_score = torchmetrics.F1(num_classes=2)
         self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.weight_decay = weight_decay
 
         self.classic_guidance = classic_guidance
         if self.classic_guidance:
-            self.model.fc = torch.nn.Linear(self.model.fc.in_features + 1, 2)
+            in_features = self.model.fc.in_features + 1
         else:
-            self.model.fc = torch.nn.Linear(self.model.fc.in_features, 2)
+            in_features = self.model.fc.in_features
+        if h == 0:
+            self.model.fc = torch.nn.Linear(in_features, 2)
+        else:
+            self.model.fc = torch.nn.Sequential(
+                torch.nn.Linear(in_features, h),
+                torch.nn.ReLU(),
+                torch.nn.Linear(h, 2)
+            )
 
         self.dp = {
             "enabled" : True,
@@ -202,7 +217,12 @@ class ClassifierModule(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(
+            self.model.parameters(), 
+            lr=self.lr,
+            betas=(self.beta1, self.beta2),
+            weight_decay=self.weight_decay
+            )
 
         if self.dp["enabled"]:
             privacy_engine = opacus.PrivacyEngine()
@@ -258,7 +278,6 @@ def main(args):
         data_module = IshidaSuiDataModule(
             batch_size=args.batch_size, 
             shuffle=args.shuffle,
-            classic_guidance=args.classic_guidance
         )
         model = ClassifierModule(
             lr=args.lr, 
@@ -267,7 +286,11 @@ def main(args):
             delta=args.dp_delta,
             max_batch_size=args.dp_max_batch_size,
             max_grad_norm=args.dp_max_grad_norm,
-            poisson_sampling=args.dp_poisson_sampling
+            poisson_sampling=args.dp_poisson_sampling,
+            weight_decay=args.weight_decay,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            h=args.mlp_hidden_size
         )
 
         checkpoint_callback_top_k = ModelCheckpoint(
@@ -310,7 +333,7 @@ def main(args):
        
 
 if __name__ == "__main__":
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S")
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--train", action="store_true",
@@ -343,6 +366,13 @@ if __name__ == "__main__":
                         help="maximum physical batch size when using dp")
     parser.add_argument("--dp_max_grad_norm", type=float, default=1.0)
     parser.add_argument("--dp_poisson_sampling", action="store_true")
+    parser.add_argument("--weight_decay", type=float, default=0)
+    parser.add_argument("--beta1", type=float, default=0.9,
+                        help="beta1 in Adam optimizer")
+    parser.add_argument("--beta2", type=float, default=0.999,
+                        help="beta2 in Adam optimizer")
+    parser.add_argument("--mlp_hidden_size", type=int, default=0,
+                        help="if 0 then no hidden layer else hidden layer size")
     
     args = parser.parse_args()
     main(args)
