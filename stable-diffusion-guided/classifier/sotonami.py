@@ -113,7 +113,6 @@ class IshidaSuiClassifierTrain(IshidaSuiClassifierDataset):
         super().__init__(**kwargs)
         self.data = self.data[self.data["split"] == "train"].reset_index(drop=True)
 
-
 class IshidaSuiClassifierVal(IshidaSuiClassifierDataset):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -257,82 +256,41 @@ class ClassifierModule(pl.LightningModule):
             wandb.log({"train_loss": loss})
         return loss
 
-
     def validation_step(self, batch, batch_idx):
         x, y = batch
         logits = self(x)
         val_loss = self.criterion(logits, y)
-        self.log("val_loss", val_loss, prog_bar=True)
         y_pred = torch.argmax(logits, dim=1)
         self.f1(y_pred, y)
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_f1", self.f1, on_step=False, on_epoch=True, prog_bar=True)
         return val_loss
 
+    def validation_epoch_end(self, outputs):
+        if wandb:
+            avg_loss = torch.stack(outputs).mean()
+            f1_score = self.f1.compute()
+            self.f1.reset()
+            wandb.log({"val_loss" : avg_loss, "val_f1" : f1_score})
+
 
 ### HYPERPARAMETER TUNING ###
-
-def zero_heavy_distribution(dist):
-    if dist == "int":
-        parent = IntDistribution
-    elif dist == "log_uniform":
-        parent = FloatDistribution
-    else:
-        raise Exception("Invalid distribution type")
-
-    class ZeroHeavyDistribution(parent):
-        """
-        With probability p, samples 0. With probability 1 - p, samples from distribution
-        given by `dist`, `low`, `high`.
-
-        IMPORTANT: If you get an AssertionError in _get_single_value for 
-        /optuna/distributions.py, simply comment out the assert statement in your
-        version of the optuna source code. 
-        """
-        def __init__(self, p, low, high):
-            self.p = p
-            self.low = low 
-            self.high = high
-            self.step = 1 if dist == "int" else None
-            self.log = dist == "log_uniform"
-    
-        def single(self):
-            if np.random.random() < self.p:
-                return 0
-            else:
-                if dist == "int":
-                    return np.random.randint(self.low, self.high + 1)
-                elif dist == "log_uniform":
-                    return np.exp(np.random.uniform(np.log(self.low), np.log(self.high)))
-                else:
-                    raise Exception("Invalid distribution type")
-
-        def _contains(self, x):
-            return self.low <= x <= self.high
-
-        def to_external_repr(self, x):
-            return x
-
-        def to_internal_repr(self, x):
-            return x
-
-        def _asdict(self):
-            return {"p" : self.p, "distribution": self.dist, "low": self.low, "high": self.high}
-
-        def __repr__(self):
-            return f"ZeroHeavyDistribution(params={str({**self._asdict(), 'dist' : dist})})"
-
-    return ZeroHeavyDistribution
-
 
 def make_objective_function(args):
     def objective(trial):
         lr = trial.suggest_loguniform("lr", 1e-5, 1e-1)
         epochs = trial.suggest_int("epochs", 10, 100)
         batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64, 128])
-        hidden_size = trial._suggest("hidden_size", 
-                                    zero_heavy_distribution("int")(0.5, 25, 100)) 
-        weight_decay = trial._suggest("weight_decay",
-                        zero_heavy_distribution("log_uniform")(0.25, 1e-6, 1e-2))
+        if np.random.random() < 0.5:
+            hidden_size = trial.suggest_int("hidden_size", 25, 100)
+        else:
+            hidden_size = 0
+            trial.params["hidden_size"] = 0
+        if np.random.random() < 0.75:
+            weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+        else:
+            weight_decay = 0
+            trial.params["weight_decay"] = 0 
 
         data_module = IshidaSuiDataModule(
             batch_size=batch_size, 
@@ -354,12 +312,12 @@ def make_objective_function(args):
         )
 
         trainer = Trainer(
-            callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=args.patience)],
+            callbacks=[EarlyStopping(monitor="val_f1", mode="max", patience=args.patience)],
             max_epochs=args.epochs, 
             gpus=args.gpus)  
         trainer.fit(model, datamodule=data_module)
 
-        return trainer.callback_metrics["val_loss"].item()
+        return trainer.callback_metrics["val_f1"].item()
     
     return objective
 
@@ -370,7 +328,7 @@ def make_logging_function(args):
             f.write(str({
                 "trial_number": trial.number,
                 "params": trial.params,
-                "val_loss": trial.value
+                "val_f1": trial.value
             }) + "\n")
 
         if args.wandb:
@@ -381,7 +339,7 @@ def make_logging_function(args):
                 "weight_decay": trial.params["weight_decay"],
                 "batch_size": trial.params["batch_size"],
                 "epochs": trial.params["epochs"],
-                "val_loss": trial.value
+                "val_f1": trial.value
             })
 
     return log_trial
@@ -455,7 +413,7 @@ def main(args):
     elif args.tune:
         objective = make_objective_function(args)
         log_trial = make_logging_function(args)
-        study = optuna.create_study(direction="minimize")
+        study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=100, callbacks=[log_trial])
         print(f"Best trial: {study.best_trial.value}")
         print("Best hyperparameters: ", study.best_trial.params)
