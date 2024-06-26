@@ -15,6 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from optuna.distributions import BaseDistribution, IntDistribution, FloatDistribution
 from PIL import Image
 
 from ldm.data.util import get_sample_rate
@@ -62,8 +63,8 @@ class IshidaSuiClassifierDataset(Dataset):
 
         # loading negatives
         neg = pd.DataFrame({
-            'filename': [f"control/samples/{i:05d}.png" for i in range(NEG_SIZE)], 
-            'label': [0] * NEG_SIZE
+            "filename": [f"control/samples/{i:05d}.png" for i in range(NEG_SIZE)], 
+            "label": [0] * NEG_SIZE
         })
 
         self.data = pd.concat([pos, neg], ignore_index=True)
@@ -122,8 +123,8 @@ class IshidaSuiClassifierVal(IshidaSuiClassifierDataset):
 ### DATALOADER ###
 
 def collate(batch):
-    images = torch.stack([item['image'] for item in batch])
-    labels = torch.tensor([item['label'] for item in batch])
+    images = torch.stack([item["image"] for item in batch])
+    labels = torch.tensor([item["label"] for item in batch])
     return images, labels
 
 
@@ -159,7 +160,6 @@ class IshidaSuiDataModule(pl.LightningDataModule):
 ### LIGHTNING MODULE ###
 
 class ClassifierModule(pl.LightningModule):
-
     def __init__(self, 
             lr=0.001, 
             dp=False, 
@@ -172,7 +172,7 @@ class ClassifierModule(pl.LightningModule):
             weight_decay=0,
             beta1=0.9,
             beta2=0.999,
-            h=0
+            h=0,
             wandb=False
         ):
         super().__init__()
@@ -181,7 +181,7 @@ class ClassifierModule(pl.LightningModule):
         for param in self.model.parameters():
             param.requires_grad = False
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.f1_score = torchmetrics.F1(num_classes=2)
+        self.f1 = torchmetrics.F1(num_classes=2)
         self.lr = lr
         self.beta1 = beta1
         self.beta2 = beta2
@@ -252,7 +252,7 @@ class ClassifierModule(pl.LightningModule):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        self.log('train_loss', loss)
+        self.log("train_loss", loss, prog_bar=True)
         if self.wandb:
             wandb.log({"train_loss": loss})
         return loss
@@ -261,31 +261,78 @@ class ClassifierModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         logits = self(x)
-
         val_loss = self.criterion(logits, y)
-        self.log('val_loss', val_loss)
-
+        self.log("val_loss", val_loss, prog_bar=True)
         y_pred = torch.argmax(logits, dim=1)
-        f1 = self.f1_score(y_pred, y)
-        self.log('val_f1', f1)
-
-        if self.wandb:
-            wandb.log({"f1": f1, "val_loss": val_loss}, on_epoch=True)
-            
+        self.f1(y_pred, y)
+        self.log("val_f1", self.f1, on_step=False, on_epoch=True, prog_bar=True)
         return val_loss
 
 
 ### HYPERPARAMETER TUNING ###
 
+def zero_heavy_distribution(dist):
+    if dist == "int":
+        parent = IntDistribution
+    elif dist == "log_uniform":
+        parent = FloatDistribution
+    else:
+        raise Exception("Invalid distribution type")
+
+    class ZeroHeavyDistribution(parent):
+        """
+        With probability p, samples 0. With probability 1 - p, samples from distribution
+        given by `dist`, `low`, `high`.
+
+        IMPORTANT: If you get an AssertionError in _get_single_value for 
+        /optuna/distributions.py, simply comment out the assert statement in your
+        version of the optuna source code. 
+        """
+        def __init__(self, p, low, high):
+            self.p = p
+            self.low = low 
+            self.high = high
+            self.step = 1 if dist == "int" else None
+            self.log = dist == "log_uniform"
+    
+        def single(self):
+            if np.random.random() < self.p:
+                return 0
+            else:
+                if dist == "int":
+                    return np.random.randint(self.low, self.high + 1)
+                elif dist == "log_uniform":
+                    return np.exp(np.random.uniform(np.log(self.low), np.log(self.high)))
+                else:
+                    raise Exception("Invalid distribution type")
+
+        def _contains(self, x):
+            return self.low <= x <= self.high
+
+        def to_external_repr(self, x):
+            return x
+
+        def to_internal_repr(self, x):
+            return x
+
+        def _asdict(self):
+            return {"p" : self.p, "distribution": self.dist, "low": self.low, "high": self.high}
+
+        def __repr__(self):
+            return f"ZeroHeavyDistribution(params={str({**self._asdict(), 'dist' : dist})})"
+
+    return ZeroHeavyDistribution
+
+
 def make_objective_function(args):
     def objective(trial):
-        lr = trial.suggest_loguniform('lr', 1e-5, 1e-1)
-        epochs = trial.suggest_int('epochs', 10, 100)
-        batch_size = trial.suggest_categorical('batch_size', [8, 16, 32, 64, 128])
-        hidden_size = (trial.suggest_int('hidden_size', 25, 100) 
-                        if np.random.random() < 0.5 else 0)
-        weight_decay = (trial.suggest_loguniform('weight_decay', 1e-6, 1e-2) 
-                        if np.random.random() < 0.75 else 0)
+        lr = trial.suggest_loguniform("lr", 1e-5, 1e-1)
+        epochs = trial.suggest_int("epochs", 10, 100)
+        batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64, 128])
+        hidden_size = trial._suggest("hidden_size", 
+                                    zero_heavy_distribution("int")(0.5, 25, 100)) 
+        weight_decay = trial._suggest("weight_decay",
+                        zero_heavy_distribution("log_uniform")(0.25, 1e-6, 1e-2))
 
         data_module = IshidaSuiDataModule(
             batch_size=batch_size, 
@@ -302,23 +349,53 @@ def make_objective_function(args):
             weight_decay=weight_decay,
             beta1=args.beta1,
             beta2=args.beta2,
-            h=hidden_size
+            h=hidden_size,
+            wandb=args.wandb
         )
 
         trainer = Trainer(
-            callbacks=[EarlyStopping(monitor='val_f1', mode="max", patience=args.patience)],
+            callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=args.patience)],
             max_epochs=args.epochs, 
             gpus=args.gpus)  
         trainer.fit(model, datamodule=data_module)
 
-        return trainer.callback_metrics["val_f1"].item()
+        return trainer.callback_metrics["val_loss"].item()
     
     return objective
+
+
+def make_logging_function(args):
+    def log_trial(study, trial):
+        with open(args.log_file, "a") as f:
+            f.write(str({
+                "trial_number": trial.number,
+                "params": trial.params,
+                "val_loss": trial.value
+            }) + "\n")
+
+        if args.wandb:
+            wandb.log({
+                "trial_number": trial.number,
+                "hidden_size": trial.params["hidden_size"],
+                "lr": trial.params["lr"],
+                "weight_decay": trial.params["weight_decay"],
+                "batch_size": trial.params["batch_size"],
+                "epochs": trial.params["epochs"],
+                "val_loss": trial.value
+            })
+
+    return log_trial
 
 
 ### MAIN ###
 
 def main(args):
+    if args.wandb:
+        wandb.init(
+            project=args.name,
+            config=vars(args)
+        )
+
     if args.train:
         torch.manual_seed(args.seed)
 
@@ -342,32 +419,26 @@ def main(args):
         )
 
         checkpoint_callback_top_k = ModelCheckpoint(
-            monitor='val_f1',               
-            dirpath=f'outputs/sotonami/{args.name}/',           
-            filename='checkpoint-{epoch:02d}',
+            monitor="val_f1",               
+            dirpath=f"outputs/sotonami/{args.name}/",           
+            filename="checkpoint-{epoch:02d}",
             save_top_k=3,                     
-            mode='max',                       
+            mode="max",                       
             save_weights_only=True,           
             verbose=True)
         checkpoint_callback_last = ModelCheckpoint(
-            dirpath=f'outputs/sotonami/{args.name}/',
-            filename='last',
+            dirpath=f"outputs/sotonami/{args.name}/",
+            filename="last",
             save_top_k=1,                     
             save_last=True,                   
             save_weights_only=True,           
             verbose=True)
         early_stopping_callback = EarlyStopping(
-            monitor='val_f1',
+            monitor="val_f1",
             mode="max",
             patience=args.patience,
             strict=True,
             verbose=True)
-        
-        if args.wandb:
-            wandb.init(
-                project=args.name,
-                config=vars(args)
-            )
         
         trainer = Trainer(
             callbacks=[checkpoint_callback_top_k, checkpoint_callback_last,
@@ -383,8 +454,11 @@ def main(args):
 
     elif args.tune:
         objective = make_objective_function(args)
-        study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=100)
+        log_trial = make_logging_function(args)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=100, callbacks=[log_trial])
+        print(f"Best trial: {study.best_trial.value}")
+        print("Best hyperparameters: ", study.best_trial.params)
        
 
 if __name__ == "__main__":
@@ -432,7 +506,8 @@ if __name__ == "__main__":
                         help="beta2 in Adam optimizer")
     parser.add_argument("--mlp_hidden_size", type=int, default=0,
                         help="if 0 then no hidden layer else hidden layer size")
-
+    parser.add_argument("--log_file", type=str, default="output.txt",
+                        help="logging file for hyperparameter tuning")
     
     args = parser.parse_args()
     main(args)
