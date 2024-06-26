@@ -173,6 +173,7 @@ class ClassifierModule(pl.LightningModule):
             beta1=0.9,
             beta2=0.999,
             h=0
+            wandb=False
         ):
         super().__init__()
         
@@ -185,6 +186,7 @@ class ClassifierModule(pl.LightningModule):
         self.beta1 = beta1
         self.beta2 = beta2
         self.weight_decay = weight_decay
+        self.wandb = wandb
 
         self.classic_guidance = classic_guidance
         if self.classic_guidance:
@@ -251,7 +253,8 @@ class ClassifierModule(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         self.log('train_loss', loss)
-        wandb.log({"train_loss": loss})
+        if self.wandb:
+            wandb.log({"train_loss": loss})
         return loss
 
 
@@ -266,7 +269,9 @@ class ClassifierModule(pl.LightningModule):
         f1 = self.f1_score(y_pred, y)
         self.log('val_f1', f1)
 
-        wandb.log({"f1": f1, "val_loss": val_loss})
+        if self.wandb:
+            wandb.log({"f1": f1, "val_loss": val_loss}, on_epoch=True)
+            
         return val_loss
 
 
@@ -281,7 +286,7 @@ def make_objective_function(args):
                         if np.random.random() < 0.5 else 0)
         weight_decay = (trial.suggest_loguniform('weight_decay', 1e-6, 1e-2) 
                         if np.random.random() < 0.75 else 0)
-                        
+
         data_module = IshidaSuiDataModule(
             batch_size=batch_size, 
             shuffle=args.shuffle,
@@ -332,7 +337,8 @@ def main(args):
             weight_decay=args.weight_decay,
             beta1=args.beta1,
             beta2=args.beta2,
-            h=args.mlp_hidden_size
+            h=args.mlp_hidden_size,
+            wandb=args.wandb
         )
 
         checkpoint_callback_top_k = ModelCheckpoint(
@@ -356,11 +362,12 @@ def main(args):
             patience=args.patience,
             strict=True,
             verbose=True)
-
-        wandb.init(
-            project=args.name,
-            config=vars(args)
-        )
+        
+        if args.wandb:
+            wandb.init(
+                project=args.name,
+                config=vars(args)
+            )
         
         trainer = Trainer(
             callbacks=[checkpoint_callback_top_k, checkpoint_callback_last,
@@ -377,7 +384,7 @@ def main(args):
     elif args.tune:
         objective = make_objective_function(args)
         study = optuna.create_study(direction='maximize')
-        study.optimize(objective, n_trials=50)
+        study.optimize(objective, n_trials=100)
        
 
 if __name__ == "__main__":
@@ -390,6 +397,8 @@ if __name__ == "__main__":
                         help="whether to perform hyperparameter tuning")
     parser.add_argument("--test", action="store_true",
                         help="whether to run the model")
+    parser.add_argument("--wandb", action="store_true",
+                        help="whether to use wandb (still WIP)")
     parser.add_argument("--gpus", type=int, default=1,
                         help="number of gpus")
     parser.add_argument("--epochs", type=int, default=10,
@@ -423,6 +432,7 @@ if __name__ == "__main__":
                         help="beta2 in Adam optimizer")
     parser.add_argument("--mlp_hidden_size", type=int, default=0,
                         help="if 0 then no hidden layer else hidden layer size")
+
     
     args = parser.parse_args()
     main(args)
