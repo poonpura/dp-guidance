@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
 import opacus
+import optuna
 import wandb
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
@@ -269,6 +270,47 @@ class ClassifierModule(pl.LightningModule):
         return val_loss
 
 
+### HYPERPARAMETER TUNING ###
+
+def make_objective_function(args):
+    def objective(trial):
+        lr = trial.suggest_loguniform('lr', 1e-5, 1e-1)
+        epochs = trial.suggest_int('epochs', 10, 100)
+        batch_size = trial.suggest_categorical('batch_size', [8, 16, 32, 64, 128])
+        hidden_size = (trial.suggest_int('hidden_size', 25, 100) 
+                        if np.random.random() < 0.5 else 0)
+        weight_decay = (trial.suggest_loguniform('weight_decay', 1e-6, 1e-2) 
+                        if np.random.random() < 0.75 else 0)
+                        
+        data_module = IshidaSuiDataModule(
+            batch_size=batch_size, 
+            shuffle=args.shuffle,
+        )
+        model = ClassifierModule(
+            lr=lr, 
+            dp=args.dp_enabled,
+            epsilon=args.dp_epsilon,
+            delta=args.dp_delta,
+            max_batch_size=args.dp_max_batch_size,
+            max_grad_norm=args.dp_max_grad_norm,
+            poisson_sampling=args.dp_poisson_sampling,
+            weight_decay=weight_decay,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            h=hidden_size
+        )
+
+        trainer = Trainer(
+            callbacks=[EarlyStopping(monitor='val_f1', mode="max", patience=args.patience)],
+            max_epochs=args.epochs, 
+            gpus=args.gpus)  
+        trainer.fit(model, datamodule=data_module)
+
+        return trainer.callback_metrics["val_f1"].item()
+    
+    return objective
+
+
 ### MAIN ###
 
 def main(args):
@@ -309,7 +351,8 @@ def main(args):
             save_weights_only=True,           
             verbose=True)
         early_stopping_callback = EarlyStopping(
-            monitor='val_loss',
+            monitor='val_f1',
+            mode="max",
             patience=args.patience,
             strict=True,
             verbose=True)
@@ -330,6 +373,11 @@ def main(args):
 
     elif args.test:
         raise NotImplementedError
+
+    elif args.tune:
+        objective = make_objective_function(args)
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=50)
        
 
 if __name__ == "__main__":
@@ -338,6 +386,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--train", action="store_true",
                         help="whether to train a model")
+    parser.add_argument("--tune", action="store_true",
+                        help="whether to perform hyperparameter tuning")
+    parser.add_argument("--test", action="store_true",
+                        help="whether to run the model")
     parser.add_argument("--gpus", type=int, default=1,
                         help="number of gpus")
     parser.add_argument("--epochs", type=int, default=10,
@@ -346,8 +398,6 @@ if __name__ == "__main__":
                         help="batch size")
     parser.add_argument("--name", type=str, default=timestamp,
                         help="name of current run for output directory + wandb")
-    parser.add_argument("--test", action="store_true",
-                        help="whether to run the model")
     parser.add_argument("--patience", type=int, default=5,
                         help="see PyTorch")
     parser.add_argument("--lr", type=float, default=0.001,
